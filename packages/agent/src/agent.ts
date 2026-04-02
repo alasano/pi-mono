@@ -147,6 +147,8 @@ type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
+	interruptController: AbortController;
+	interrupted: boolean;
 };
 
 /**
@@ -287,6 +289,15 @@ export class Agent {
 	/** Abort the current run, if one is active. */
 	abort(): void {
 		this.activeRun?.abortController.abort();
+	}
+
+	/** Interrupt the current run, if one is active. */
+	interrupt(): void {
+		if (!this.activeRun || this.activeRun.interrupted) {
+			return;
+		}
+		this.activeRun.interrupted = true;
+		this.activeRun.interruptController.abort();
 	}
 
 	/**
@@ -432,6 +443,8 @@ export class Agent {
 				return this.steeringQueue.drain();
 			},
 			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			interruptSignal: this.activeRun?.interruptController.signal,
+			isInterrupted: () => this.activeRun?.interrupted ?? false,
 		};
 	}
 
@@ -441,11 +454,18 @@ export class Agent {
 		}
 
 		const abortController = new AbortController();
+		const interruptController = new AbortController();
 		let resolvePromise = () => {};
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		this.activeRun = {
+			promise,
+			resolve: resolvePromise,
+			abortController,
+			interruptController,
+			interrupted: false,
+		};
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;

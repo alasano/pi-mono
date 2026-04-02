@@ -47,6 +47,23 @@ function createDeferred(): {
 	return { promise, resolve };
 }
 
+interface ActiveRunForInterruptTests {
+	interruptController: AbortController;
+	interrupted: boolean;
+}
+
+interface AgentPrivateForInterruptTests {
+	activeRun?: ActiveRunForInterruptTests;
+	createLoopConfig: () => {
+		interruptSignal?: AbortSignal;
+		isInterrupted?: () => boolean;
+	};
+}
+
+function getAgentPrivate(agent: Agent): AgentPrivateForInterruptTests {
+	return agent as unknown as AgentPrivateForInterruptTests;
+}
+
 describe("Agent", () => {
 	it("should create an agent instance with default state", () => {
 		const agent = new Agent();
@@ -275,6 +292,99 @@ describe("Agent", () => {
 
 		// Should not throw even if nothing is running
 		expect(() => agent.abort()).not.toThrow();
+	});
+
+	it("interrupt should be a no-op while idle", () => {
+		const agent = new Agent();
+		agent.steer({ role: "user", content: "queued steering", timestamp: Date.now() });
+		agent.followUp({ role: "user", content: "queued follow-up", timestamp: Date.now() + 1 });
+
+		expect(() => agent.interrupt()).not.toThrow();
+		expect(agent.state.isStreaming).toBe(false);
+		expect(agent.hasQueuedMessages()).toBe(true);
+		expect(agent.state.messages).toEqual([]);
+	});
+
+	it("interrupt should be idempotent during an active run", async () => {
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					const checkAbort = () => {
+						if (options?.signal?.aborted) {
+							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
+						} else {
+							setTimeout(checkAbort, 5);
+						}
+					};
+					checkAbort();
+				});
+				return stream;
+			},
+		});
+
+		const promptPromise = agent.prompt("hello");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		const agentPrivate = getAgentPrivate(agent);
+		const activeRun = agentPrivate.activeRun;
+		expect(activeRun).toBeDefined();
+		if (!activeRun) throw new Error("Expected an active run");
+		let abortCount = 0;
+		activeRun.interruptController.signal.addEventListener("abort", () => {
+			abortCount++;
+		});
+
+		agent.interrupt();
+		agent.interrupt();
+
+		expect(activeRun.interrupted).toBe(true);
+		expect(activeRun.interruptController.signal.aborted).toBe(true);
+		expect(abortCount).toBe(1);
+
+		agent.abort();
+		await promptPromise;
+	});
+
+	it("should wire interrupt state into loop config", async () => {
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					const checkAbort = () => {
+						if (options?.signal?.aborted) {
+							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
+						} else {
+							setTimeout(checkAbort, 5);
+						}
+					};
+					checkAbort();
+				});
+				return stream;
+			},
+		});
+
+		const promptPromise = agent.prompt("hello");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		const agentPrivate = getAgentPrivate(agent);
+		const activeRun = agentPrivate.activeRun;
+		expect(activeRun).toBeDefined();
+		if (!activeRun) throw new Error("Expected an active run");
+		const configBeforeInterrupt = agentPrivate.createLoopConfig();
+		expect(configBeforeInterrupt.interruptSignal).toBe(activeRun.interruptController.signal);
+		expect(configBeforeInterrupt.isInterrupted?.()).toBe(false);
+
+		agent.interrupt();
+
+		const configAfterInterrupt = agentPrivate.createLoopConfig();
+		expect(configAfterInterrupt.interruptSignal).toBe(activeRun.interruptController.signal);
+		expect(configAfterInterrupt.isInterrupted?.()).toBe(true);
+
+		agent.abort();
+		await promptPromise;
 	});
 
 	it("should throw when prompt() called while streaming", async () => {

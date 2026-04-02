@@ -236,6 +236,62 @@ describe("agentLoop with AgentMessage", () => {
 		expect(convertedMessages.length).toBe(2);
 	});
 
+	it("should preserve existing stream option passthrough, including interrupt fields", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const interruptController = new AbortController();
+		const isInterrupted = () => false;
+		const beforeToolCall = async () => undefined;
+		const afterToolCall = async () => undefined;
+		const getSteeringMessages = async () => [];
+		const getFollowUpMessages = async () => [];
+		let receivedOptions: Record<string, unknown> | undefined;
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			interruptSignal: interruptController.signal,
+			isInterrupted,
+			beforeToolCall,
+			afterToolCall,
+			getSteeringMessages,
+			getFollowUpMessages,
+			toolExecution: "sequential",
+			sessionId: "session-123",
+		};
+
+		const streamFn = (_model: Model<any>, _llmContext: unknown, options?: object) => {
+			receivedOptions = options as Record<string, unknown> | undefined;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "Hi there!" }]);
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(receivedOptions).toBeDefined();
+		expect(receivedOptions).toMatchObject({
+			interruptSignal: interruptController.signal,
+			isInterrupted,
+			beforeToolCall,
+			afterToolCall,
+			getSteeringMessages,
+			getFollowUpMessages,
+			toolExecution: "sequential",
+			sessionId: "session-123",
+		});
+	});
+
 	it("should handle tool calls and results", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: string[] = [];

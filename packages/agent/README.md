@@ -281,9 +281,12 @@ agent.thinkingBudgets = {
 ### Control
 
 ```typescript
-agent.abort();           // Cancel current operation
+agent.abort();             // Hard-abort the current run
+agent.interrupt();         // Mark the current run as interrupted
 await agent.waitForIdle(); // Wait for completion
 ```
+
+`agent.interrupt(): void` is a no-op when the agent is idle and is idempotent within a run. In the current implementation it only exposes interruption state to the loop configuration; graceful interruption semantics are added in later work.
 
 ### Events
 

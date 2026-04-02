@@ -201,6 +201,16 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	toolExecution?: ToolExecutionMode;
 
 	/**
+	 * Optional signal used to interrupt assistant-phase work without hard-aborting the run.
+	 */
+	interruptSignal?: AbortSignal;
+
+	/**
+	 * Optional callback that reports whether the current run has been interrupted.
+	 */
+	isInterrupted?: () => boolean;
+
+	/**
 	 * Called before a tool is executed, after arguments have been validated.
 	 *
 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool result instead.

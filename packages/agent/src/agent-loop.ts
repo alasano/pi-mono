@@ -24,6 +24,13 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
+type AssistantAbortState = {
+	signal: AbortSignal;
+	hardAborted: boolean;
+	interruptAborted: boolean;
+	cleanup: () => void;
+};
+
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -233,6 +240,111 @@ async function runLoop(
 	await emit({ type: "agent_end", messages: newMessages });
 }
 
+function createAssistantAbortState(
+	hardSignal: AbortSignal | undefined,
+	interruptSignal: AbortSignal | undefined,
+): AssistantAbortState {
+	const controller = new AbortController();
+	const state: AssistantAbortState = {
+		signal: controller.signal,
+		hardAborted: false,
+		interruptAborted: false,
+		cleanup: () => {
+			if (hardSignal) {
+				hardSignal.removeEventListener("abort", onHardAbort);
+			}
+			if (interruptSignal) {
+				interruptSignal.removeEventListener("abort", onInterruptAbort);
+			}
+		},
+	};
+
+	const abortCombined = () => {
+		if (!controller.signal.aborted) {
+			controller.abort();
+		}
+	};
+
+	const onHardAbort = () => {
+		state.hardAborted = true;
+		abortCombined();
+	};
+
+	const onInterruptAbort = () => {
+		state.interruptAborted = true;
+		abortCombined();
+	};
+
+	if (hardSignal?.aborted) {
+		onHardAbort();
+	} else if (hardSignal) {
+		hardSignal.addEventListener("abort", onHardAbort, { once: true });
+	}
+
+	if (interruptSignal?.aborted) {
+		onInterruptAbort();
+	} else if (interruptSignal) {
+		interruptSignal.addEventListener("abort", onInterruptAbort, { once: true });
+	}
+
+	return state;
+}
+
+function normalizeAssistantStopReason(message: AssistantMessage, abortState: AssistantAbortState): AssistantMessage {
+	if (message.stopReason !== "aborted") {
+		return message;
+	}
+	if (abortState.hardAborted || !abortState.interruptAborted) {
+		return message;
+	}
+	return {
+		...message,
+		stopReason: "interrupted",
+	};
+}
+
+function createInterruptedAssistantMessage(
+	config: AgentLoopConfig,
+	stopReason: "aborted" | "interrupted",
+): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				total: 0,
+			},
+		},
+		stopReason,
+		timestamp: Date.now(),
+	};
+}
+
+async function emitInterruptedAssistantMessage(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	abortState: AssistantAbortState,
+): Promise<AssistantMessage> {
+	const message = createInterruptedAssistantMessage(config, abortState.hardAborted ? "aborted" : "interrupted");
+	context.messages.push(message);
+	await emit({ type: "message_start", message: { ...message } });
+	await emit({ type: "message_end", message });
+	return message;
+}
+
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
@@ -244,92 +356,103 @@ async function streamAssistantResponse(
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
-	}
+	const assistantAbortState = createAssistantAbortState(signal, config.interruptSignal);
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
+	try {
+		let messages = context.messages;
+		if (config.transformContext) {
+			messages = await config.transformContext(messages, assistantAbortState.signal);
+		}
 
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-	};
+		if (assistantAbortState.signal.aborted) {
+			return emitInterruptedAssistantMessage(context, config, emit, assistantAbortState);
+		}
 
-	const streamFunction = streamFn || streamSimple;
+		const llmMessages = await config.convertToLlm(messages);
+		if (assistantAbortState.signal.aborted) {
+			return emitInterruptedAssistantMessage(context, config, emit, assistantAbortState);
+		}
 
-	// Resolve API key (important for expiring tokens)
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+		const llmContext: Context = {
+			systemPrompt: context.systemPrompt,
+			messages: llmMessages,
+			tools: context.tools,
+		};
 
-	const response = await streamFunction(config.model, llmContext, {
-		...config,
-		apiKey: resolvedApiKey,
-		signal,
-	});
+		const streamFunction = streamFn || streamSimple;
+		const resolvedApiKey =
+			(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+		if (assistantAbortState.signal.aborted) {
+			return emitInterruptedAssistantMessage(context, config, emit, assistantAbortState);
+		}
 
-	let partialMessage: AssistantMessage | null = null;
-	let addedPartial = false;
+		const response = await streamFunction(config.model, llmContext, {
+			...config,
+			apiKey: resolvedApiKey,
+			signal: assistantAbortState.signal,
+		});
 
-	for await (const event of response) {
-		switch (event.type) {
-			case "start":
-				partialMessage = event.partial;
-				context.messages.push(partialMessage);
-				addedPartial = true;
-				await emit({ type: "message_start", message: { ...partialMessage } });
-				break;
+		let partialMessage: AssistantMessage | null = null;
+		let addedPartial = false;
 
-			case "text_start":
-			case "text_delta":
-			case "text_end":
-			case "thinking_start":
-			case "thinking_delta":
-			case "thinking_end":
-			case "toolcall_start":
-			case "toolcall_delta":
-			case "toolcall_end":
-				if (partialMessage) {
+		for await (const event of response) {
+			switch (event.type) {
+				case "start":
 					partialMessage = event.partial;
-					context.messages[context.messages.length - 1] = partialMessage;
-					await emit({
-						type: "message_update",
-						assistantMessageEvent: event,
-						message: { ...partialMessage },
-					});
-				}
-				break;
+					context.messages.push(partialMessage);
+					addedPartial = true;
+					await emit({ type: "message_start", message: { ...partialMessage } });
+					break;
 
-			case "done":
-			case "error": {
-				const finalMessage = await response.result();
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
-				} else {
-					context.messages.push(finalMessage);
+				case "text_start":
+				case "text_delta":
+				case "text_end":
+				case "thinking_start":
+				case "thinking_delta":
+				case "thinking_end":
+				case "toolcall_start":
+				case "toolcall_delta":
+				case "toolcall_end":
+					if (partialMessage) {
+						partialMessage = event.partial;
+						context.messages[context.messages.length - 1] = partialMessage;
+						await emit({
+							type: "message_update",
+							assistantMessageEvent: event,
+							message: { ...partialMessage },
+						});
+					}
+					break;
+
+				case "done":
+				case "error": {
+					const finalMessage = normalizeAssistantStopReason(await response.result(), assistantAbortState);
+					if (addedPartial) {
+						context.messages[context.messages.length - 1] = finalMessage;
+					} else {
+						context.messages.push(finalMessage);
+					}
+					if (!addedPartial) {
+						await emit({ type: "message_start", message: { ...finalMessage } });
+					}
+					await emit({ type: "message_end", message: finalMessage });
+					return finalMessage;
 				}
-				if (!addedPartial) {
-					await emit({ type: "message_start", message: { ...finalMessage } });
-				}
-				await emit({ type: "message_end", message: finalMessage });
-				return finalMessage;
 			}
 		}
-	}
 
-	const finalMessage = await response.result();
-	if (addedPartial) {
-		context.messages[context.messages.length - 1] = finalMessage;
-	} else {
-		context.messages.push(finalMessage);
-		await emit({ type: "message_start", message: { ...finalMessage } });
+		const finalMessage = normalizeAssistantStopReason(await response.result(), assistantAbortState);
+		if (addedPartial) {
+			context.messages[context.messages.length - 1] = finalMessage;
+		} else {
+			context.messages.push(finalMessage);
+			await emit({ type: "message_start", message: { ...finalMessage } });
+		}
+		await emit({ type: "message_end", message: finalMessage });
+		return finalMessage;
+	} finally {
+		assistantAbortState.cleanup();
 	}
-	await emit({ type: "message_end", message: finalMessage });
-	return finalMessage;
 }
 
 /**

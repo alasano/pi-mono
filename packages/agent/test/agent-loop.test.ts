@@ -9,7 +9,7 @@ import {
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue } from "../src/agent-loop.js";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.js";
+import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, StreamFn } from "../src/types.js";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -264,7 +264,7 @@ describe("agentLoop with AgentMessage", () => {
 			sessionId: "session-123",
 		};
 
-		const streamFn = (_model: Model<any>, _llmContext: unknown, options?: object) => {
+		const streamFn: StreamFn = (_model, _llmContext, options) => {
 			receivedOptions = options as Record<string, unknown> | undefined;
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
@@ -290,6 +290,250 @@ describe("agentLoop with AgentMessage", () => {
 			toolExecution: "sequential",
 			sessionId: "session-123",
 		});
+	});
+
+	it("should rewrite aborted assistant streams to interrupted when interrupted", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const interruptController = new AbortController();
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			interruptSignal: interruptController.signal,
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, (_model, _llmContext, options) => {
+			const signal = options?.signal;
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const partial = createAssistantMessage([], "aborted");
+				mockStream.push({ type: "start", partial });
+				queueMicrotask(() => interruptController.abort());
+			});
+			signal?.addEventListener(
+				"abort",
+				() => {
+					const aborted = createAssistantMessage([{ type: "text", text: "partial" }], "aborted");
+					mockStream.push({ type: "error", reason: "aborted", error: aborted });
+				},
+				{ once: true },
+			);
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		const messages = await stream.result();
+		const assistant = [...messages].reverse().find((message) => message.role === "assistant");
+		if (!assistant || assistant.role !== "assistant") {
+			throw new Error("Expected assistant message");
+		}
+		expect(assistant.stopReason).toBe("interrupted");
+	});
+
+	it("should preserve natural assistant completion if the stream finishes before interrupt takes effect", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const interruptController = new AbortController();
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			interruptSignal: interruptController.signal,
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, () => {
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "done" }], "stop");
+				mockStream.push({ type: "done", reason: "stop", message });
+				queueMicrotask(() => interruptController.abort());
+			});
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		const messages = await stream.result();
+		const assistant = [...messages].reverse().find((message) => message.role === "assistant");
+		if (!assistant || assistant.role !== "assistant") {
+			throw new Error("Expected assistant message");
+		}
+		expect(assistant.stopReason).toBe("stop");
+	});
+
+	it("should synthesize an interrupted assistant message when transformContext is interrupted", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const interruptController = new AbortController();
+		let streamCalled = false;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			interruptSignal: interruptController.signal,
+			transformContext: async (messages, signal) => {
+				interruptController.abort();
+				expect(signal?.aborted).toBe(true);
+				return messages;
+			},
+			convertToLlm: identityConverter,
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, () => {
+			streamCalled = true;
+			const mockStream = new MockAssistantStream();
+			return mockStream;
+		});
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const assistantEvents = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_start" | "message_end" }> =>
+				event.type === "message_start" || event.type === "message_end",
+		);
+		const assistantMessages = assistantEvents.filter((event) => event.message.role === "assistant");
+		const messages = await stream.result();
+		const assistant = [...messages].reverse().find((message) => message.role === "assistant");
+		if (!assistant || assistant.role !== "assistant") {
+			throw new Error("Expected assistant message");
+		}
+
+		expect(streamCalled).toBe(false);
+		expect(assistantMessages).toHaveLength(2);
+		expect(assistantMessages[0].type).toBe("message_start");
+		expect(assistantMessages[1].type).toBe("message_end");
+		expect(assistant.content).toEqual([]);
+		expect(assistant.usage).toEqual(createUsage());
+		expect(assistant.stopReason).toBe("interrupted");
+	});
+
+	it("should synthesize an interrupted assistant message when api key resolution is interrupted", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const interruptController = new AbortController();
+		let streamCalled = false;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			interruptSignal: interruptController.signal,
+			convertToLlm: identityConverter,
+			getApiKey: async () => {
+				interruptController.abort();
+				await Promise.resolve();
+				return "resolved-api-key";
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, () => {
+			streamCalled = true;
+			const mockStream = new MockAssistantStream();
+			return mockStream;
+		});
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const assistantEvents = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_start" | "message_end" }> =>
+				event.type === "message_start" || event.type === "message_end",
+		);
+		const assistantMessages = assistantEvents.filter((event) => event.message.role === "assistant");
+		const messages = await stream.result();
+		const assistant = [...messages].reverse().find((message) => message.role === "assistant");
+		if (!assistant || assistant.role !== "assistant") {
+			throw new Error("Expected assistant message");
+		}
+
+		expect(streamCalled).toBe(false);
+		expect(assistantMessages).toHaveLength(2);
+		expect(assistantMessages[0].type).toBe("message_start");
+		expect(assistantMessages[1].type).toBe("message_end");
+		expect(assistant.content).toEqual([]);
+		expect(assistant.usage).toEqual(createUsage());
+		expect(assistant.stopReason).toBe("interrupted");
+	});
+
+	it("should keep assistant stopReason aborted when abort follows interrupt", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const interruptController = new AbortController();
+		const hardAbortController = new AbortController();
+		let releaseError: (() => void) | undefined;
+		const errorReady = new Promise<void>((resolve) => {
+			releaseError = resolve;
+		});
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			interruptSignal: interruptController.signal,
+		};
+
+		const stream = agentLoop(
+			[userPrompt],
+			context,
+			config,
+			hardAbortController.signal,
+			(_model, _llmContext, options) => {
+				const signal = options?.signal;
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => {
+					mockStream.push({ type: "start", partial: createAssistantMessage([], "aborted") });
+					queueMicrotask(() => interruptController.abort());
+				});
+				signal?.addEventListener(
+					"abort",
+					() => {
+						void errorReady.then(() => {
+							const message = createAssistantMessage([{ type: "text", text: "partial" }], "aborted");
+							mockStream.push({ type: "error", reason: "aborted", error: message });
+						});
+					},
+					{ once: true },
+				);
+				return mockStream;
+			},
+		);
+
+		await Promise.resolve();
+		hardAbortController.abort();
+		releaseError?.();
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		const messages = await stream.result();
+		const assistant = [...messages].reverse().find((message) => message.role === "assistant");
+		if (!assistant || assistant.role !== "assistant") {
+			throw new Error("Expected assistant message");
+		}
+		expect(assistant.stopReason).toBe("aborted");
 	});
 
 	it("should handle tool calls and results", async () => {

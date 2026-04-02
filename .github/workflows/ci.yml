@@ -35,6 +35,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Check generated files are up to date
+        run: git diff --exit-code packages/ai/src/models.generated.ts
+
       - name: Check
         run: npm run check
 

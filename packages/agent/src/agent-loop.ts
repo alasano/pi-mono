@@ -213,6 +213,13 @@ async function runLoop(
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<void> {
+	if (config.interruptSignal !== undefined && config.isInterrupted === undefined) {
+		throw new Error(
+			"interruptSignal requires isInterrupted to be provided. " +
+				"Without isInterrupted, the assistant stream will be interrupted but the loop will not exit after turn_end.",
+		);
+	}
+
 	let firstTurn = true;
 	let pendingMessages: AgentMessage[] = [];
 	let pendingMessagesKind: QueueKind | undefined;
@@ -616,9 +623,11 @@ async function executeToolCallsParallel(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
-	const finalizedCalls: FinalizedToolCallEntry[] = [];
+	const finalizedSlots: (FinalizedToolCallOutcome | undefined)[] = new Array(toolCalls.length).fill(undefined);
+	const runnableCalls: { prepared: PreparedToolCall; index: number }[] = [];
 
-	for (const toolCall of toolCalls) {
+	for (let i = 0; i < toolCalls.length; i++) {
+		const toolCall = toolCalls[i];
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -634,27 +643,34 @@ async function executeToolCallsParallel(
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
-			finalizedCalls.push(finalized);
-			continue;
+			finalizedSlots[i] = finalized;
+		} else {
+			runnableCalls.push({ prepared: preparation, index: i });
 		}
+	}
 
-		finalizedCalls.push(async () => {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
+	const finalizedEntries = await Promise.all(
+		runnableCalls.map(async (entry) => {
+			const executed = await executePreparedToolCall(entry.prepared, signal, emit);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
-				preparation,
+				entry.prepared,
 				executed,
 				config,
 				signal,
 			);
 			await emitToolExecutionEnd(finalized, emit);
-			return finalized;
-		});
+			return { finalized, index: entry.index };
+		}),
+	);
+
+	for (const entry of finalizedEntries) {
+		finalizedSlots[entry.index] = entry.finalized;
 	}
 
-	const orderedFinalizedCalls = await Promise.all(
-		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	const orderedFinalizedCalls = finalizedSlots.filter(
+		(finalized): finalized is FinalizedToolCallOutcome => finalized !== undefined,
 	);
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
@@ -692,8 +708,6 @@ type FinalizedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
 };
-
-type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
 
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);

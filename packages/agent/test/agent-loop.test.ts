@@ -304,6 +304,7 @@ describe("agentLoop with AgentMessage", () => {
 			model: createModel(),
 			convertToLlm: identityConverter,
 			interruptSignal: interruptController.signal,
+			isInterrupted: () => interruptController.signal.aborted,
 		};
 
 		const stream = agentLoop([userPrompt], context, config, undefined, (_model, _llmContext, options) => {
@@ -349,6 +350,7 @@ describe("agentLoop with AgentMessage", () => {
 			model: createModel(),
 			convertToLlm: identityConverter,
 			interruptSignal: interruptController.signal,
+			isInterrupted: () => interruptController.signal.aborted,
 		};
 
 		const stream = agentLoop([userPrompt], context, config, undefined, () => {
@@ -385,6 +387,7 @@ describe("agentLoop with AgentMessage", () => {
 		const config: AgentLoopConfig = {
 			model: createModel(),
 			interruptSignal: interruptController.signal,
+			isInterrupted: () => interruptController.signal.aborted,
 			transformContext: async (messages, signal) => {
 				interruptController.abort();
 				expect(signal?.aborted).toBe(true);
@@ -436,11 +439,62 @@ describe("agentLoop with AgentMessage", () => {
 		const config: AgentLoopConfig = {
 			model: createModel(),
 			interruptSignal: interruptController.signal,
+			isInterrupted: () => interruptController.signal.aborted,
 			convertToLlm: identityConverter,
 			getApiKey: async () => {
 				interruptController.abort();
 				await Promise.resolve();
 				return "resolved-api-key";
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, () => {
+			streamCalled = true;
+			const mockStream = new MockAssistantStream();
+			return mockStream;
+		});
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const assistantEvents = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_start" | "message_end" }> =>
+				event.type === "message_start" || event.type === "message_end",
+		);
+		const assistantMessages = assistantEvents.filter((event) => event.message.role === "assistant");
+		const messages = await stream.result();
+		const assistant = [...messages].reverse().find((message) => message.role === "assistant");
+		if (!assistant || assistant.role !== "assistant") {
+			throw new Error("Expected assistant message");
+		}
+
+		expect(streamCalled).toBe(false);
+		expect(assistantMessages).toHaveLength(2);
+		expect(assistantMessages[0].type).toBe("message_start");
+		expect(assistantMessages[1].type).toBe("message_end");
+		expect(assistant.content).toEqual([]);
+		expect(assistant.usage).toEqual(createUsage());
+		expect(assistant.stopReason).toBe("interrupted");
+	});
+
+	it("should synthesize an interrupted assistant message when convertToLlm is interrupted", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const interruptController = new AbortController();
+		let streamCalled = false;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			interruptSignal: interruptController.signal,
+			isInterrupted: () => interruptController.signal.aborted,
+			convertToLlm: (messages) => {
+				interruptController.abort();
+				return identityConverter(messages);
 			},
 		};
 
@@ -492,6 +546,7 @@ describe("agentLoop with AgentMessage", () => {
 			model: createModel(),
 			convertToLlm: identityConverter,
 			interruptSignal: interruptController.signal,
+			isInterrupted: () => interruptController.signal.aborted,
 		};
 
 		const stream = agentLoop(
@@ -1572,6 +1627,7 @@ describe("agentLoop with AgentMessage", () => {
 		});
 
 		expect(executed).toEqual(["first"]);
+		// Events fire in execution order (blocked tools emit during preflight, executed tools after)
 		expect(
 			toolEnds
 				.map((event) => ({ id: event.toolCallId, isError: event.isError }))
@@ -1581,6 +1637,13 @@ describe("agentLoop with AgentMessage", () => {
 			{ id: "tool-2", isError: true },
 			{ id: "tool-3", isError: true },
 		]);
+		// The returned tool results array (used for context and turn_end) must be in source order
+		const turnEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "turn_end" }> => event.type === "turn_end",
+		);
+		if (!turnEnd || turnEnd.type !== "turn_end") throw new Error("Expected turn_end");
+		const turnEndToolResults = turnEnd.toolResults;
+		expect(turnEndToolResults.map((r) => r.toolCallId)).toEqual(["tool-1", "tool-2", "tool-3"]);
 		expect(blockedEnds).toHaveLength(2);
 		expect(blockedMessages.map((message) => message.content[0])).toEqual([
 			{ type: "text", text: "Tool execution was blocked: session interrupted" },
@@ -1801,6 +1864,95 @@ describe("agentLoop with AgentMessage", () => {
 		expect(toolEnds.map((event) => event.isError)).toEqual([false, false]);
 	});
 
+	it("should exit after turn_end when interrupt fires after all tools complete but before next turn", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		let interrupted = false;
+		const executed: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		let streamCallCount = 0;
+		let steeringPollCount = 0;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "sequential",
+			isInterrupted: () => interrupted,
+			afterToolCall: async ({ toolCall }) => {
+				if (toolCall.id === "tool-2") {
+					interrupted = true;
+				}
+				return undefined;
+			},
+			getSteeringMessages: async () => {
+				steeringPollCount++;
+				return [];
+			},
+			getFollowUpMessages: async () => [],
+		};
+
+		const events: AgentEvent[] = [];
+		await runAgentLoop(
+			[createUserMessage("run tools")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			config,
+			async (event) => {
+				events.push(event);
+			},
+			undefined,
+			() => {
+				streamCallCount++;
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => {
+					mockStream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage(
+							[
+								{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } },
+								{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "second" } },
+							],
+							"toolUse",
+						),
+					});
+				});
+				return mockStream;
+			},
+		);
+
+		expect(executed).toEqual(["first", "second"]);
+		expect(streamCallCount).toBe(1);
+
+		const eventTypes = events.map((event) => event.type);
+		const turnEndIndex = eventTypes.lastIndexOf("turn_end");
+		const agentEndIndex = eventTypes.lastIndexOf("agent_end");
+		expect(turnEndIndex).toBeGreaterThan(-1);
+		expect(agentEndIndex).toBeGreaterThan(turnEndIndex);
+
+		const toolResults = events.flatMap((event) => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") {
+				return [];
+			}
+			return [event.message];
+		});
+		expect(toolResults).toHaveLength(2);
+		expect(toolResults.every((result) => !result.isError)).toBe(true);
+		// Initial steering poll happens before the first turn, but the post-turn steering poll
+		// should be skipped because the interrupt check fires immediately after turn_end.
+		expect(steeringPollCount).toBe(1);
+	});
+
 	it.each([
 		{
 			name: "prompt callers",
@@ -2008,6 +2160,7 @@ describe("agentLoop with AgentMessage", () => {
 			model: createModel(),
 			convertToLlm: identityConverter,
 			interruptSignal: interruptController.signal,
+			isInterrupted: () => interruptController.signal.aborted,
 		};
 
 		const events: AgentEvent[] = [];

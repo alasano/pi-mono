@@ -31,6 +31,8 @@ type AssistantAbortState = {
 	cleanup: () => void;
 };
 
+type QueueKind = "steering" | "follow-up";
+
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -156,6 +158,50 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
+function isRunInterrupted(config: AgentLoopConfig): boolean {
+	return config.isInterrupted?.() ?? false;
+}
+
+function getQueueCallbacks(config: AgentLoopConfig, kind: QueueKind) {
+	if (kind === "steering") {
+		return {
+			getMessages: config.getSteeringMessages,
+			requeueMessages: config.requeueSteeringMessages,
+		};
+	}
+	return {
+		getMessages: config.getFollowUpMessages,
+		requeueMessages: config.requeueFollowUpMessages,
+	};
+}
+
+function getInterruptedToolOutcome(config: AgentLoopConfig): ImmediateToolCallOutcome | undefined {
+	if (!isRunInterrupted(config)) {
+		return undefined;
+	}
+	return {
+		kind: "immediate",
+		result: createErrorToolResult("Tool execution was blocked: session interrupted"),
+		isError: true,
+	};
+}
+
+async function pollQueuedMessages(config: AgentLoopConfig, kind: QueueKind): Promise<AgentMessage[]> {
+	const { getMessages } = getQueueCallbacks(config, kind);
+	if (!getMessages) {
+		return [];
+	}
+	return (await getMessages()) || [];
+}
+
+function preserveQueuedMessages(config: AgentLoopConfig, kind: QueueKind, messages: AgentMessage[]): void {
+	if (messages.length === 0) {
+		return;
+	}
+	const { requeueMessages } = getQueueCallbacks(config, kind);
+	requeueMessages?.(messages);
+}
+
 /**
  * Main loop logic shared by agentLoop and agentLoopContinue.
  */
@@ -168,8 +214,32 @@ async function runLoop(
 	streamFn?: StreamFn,
 ): Promise<void> {
 	let firstTurn = true;
-	// Check for steering messages at start (user may have typed while waiting)
-	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let pendingMessages: AgentMessage[] = [];
+	let pendingMessagesKind: QueueKind | undefined;
+
+	const consumePendingMessages = async () => {
+		for (const message of pendingMessages) {
+			await emit({ type: "message_start", message });
+			await emit({ type: "message_end", message });
+			currentContext.messages.push(message);
+			newMessages.push(message);
+		}
+		pendingMessages = [];
+		pendingMessagesKind = undefined;
+	};
+
+	const requeuePendingMessages = () => {
+		if (pendingMessages.length > 0 && pendingMessagesKind !== undefined) {
+			preserveQueuedMessages(config, pendingMessagesKind, pendingMessages);
+			pendingMessages = [];
+			pendingMessagesKind = undefined;
+		}
+	};
+
+	if (!config.skipInitialSteeringPoll) {
+		pendingMessages = await pollQueuedMessages(config, "steering");
+		pendingMessagesKind = pendingMessages.length > 0 ? "steering" : undefined;
+	}
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -183,16 +253,7 @@ async function runLoop(
 				firstTurn = false;
 			}
 
-			// Process pending messages (inject before next assistant response)
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
-				pendingMessages = [];
-			}
+			await consumePendingMessages();
 
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
@@ -222,18 +283,33 @@ async function runLoop(
 
 			await emit({ type: "turn_end", message, toolResults });
 
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			if (isRunInterrupted(config)) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			pendingMessages = await pollQueuedMessages(config, "steering");
+			pendingMessagesKind = pendingMessages.length > 0 ? "steering" : undefined;
+			if (pendingMessages.length > 0 && isRunInterrupted(config)) {
+				requeuePendingMessages();
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.
-		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		const followUpMessages = await pollQueuedMessages(config, "follow-up");
+		pendingMessages = followUpMessages;
+		pendingMessagesKind = followUpMessages.length > 0 ? "follow-up" : undefined;
+		if (followUpMessages.length > 0 && isRunInterrupted(config)) {
+			requeuePendingMessages();
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 		if (followUpMessages.length > 0) {
-			// Set as pending so inner loop processes them
-			pendingMessages = followUpMessages;
 			continue;
 		}
 
-		// No more messages, exit
 		break;
 	}
 
@@ -653,6 +729,11 @@ async function prepareToolCall(
 		};
 	}
 
+	const preflightInterrupted = getInterruptedToolOutcome(config);
+	if (preflightInterrupted) {
+		return preflightInterrupted;
+	}
+
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);
@@ -674,6 +755,12 @@ async function prepareToolCall(
 				};
 			}
 		}
+
+		const interruptedAfterHook = getInterruptedToolOutcome(config);
+		if (interruptedAfterHook) {
+			return interruptedAfterHook;
+		}
+
 		return {
 			kind: "prepared",
 			toolCall,

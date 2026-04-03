@@ -112,6 +112,12 @@ The `beforeToolCall` hook runs after `tool_execution_start` and validated argume
 
 Tools can also return `terminate: true` to hint that the automatic follow-up LLM call should be skipped. The loop only stops early when every finalized tool result in that batch sets `terminate: true`. Mixed batches continue normally.
 
+`interrupt()` affects tool execution differently from `abort()`:
+
+- in `sequential` mode, the currently running tool is allowed to finish, and each later not-yet-started tool call is converted into an explicit error tool result
+- in `parallel` mode, any tool call already promoted into the runnable set is allowed to finish, while later tool calls that have not finished preflight become explicit error tool results
+- if all parallel tool calls have already been dispatched when interruption happens, they all finish normally and no blocked tool results are produced
+
 When you use the `Agent` class, assistant `message_end` processing is treated as a barrier before tool preflight begins. That means `beforeToolCall` sees agent state that already includes the assistant message that requested the tool call.
 
 ### continue() Event Sequence
@@ -286,7 +292,17 @@ agent.interrupt();         // Mark the current run as interrupted
 await agent.waitForIdle(); // Wait for completion
 ```
 
-`agent.interrupt(): void` is a no-op when the agent is idle and is idempotent within a run. In the current implementation it only exposes interruption state to the loop configuration; graceful interruption semantics are added in later work.
+`agent.interrupt(): void` is a no-op when the agent is idle and is idempotent within a run.
+
+When you interrupt an active run, the current assistant turn winds down gracefully:
+
+- the active assistant stream is stopped, and the finalized assistant message uses `stopReason: "interrupted"` if the stream was actually cut short
+- already-running tools are allowed to finish
+- remaining not-yet-started tool calls are blocked and emitted as error tool results
+- after the current turn emits `turn_end`, the run emits `agent_end` and returns to idle without starting another assistant turn
+- queued `steer()` and `followUp()` messages are not consumed by the interrupted run and remain available to the next `prompt()` or `continue()` call
+
+If you escalate from `interrupt()` to `abort()` before the current run settles, hard-abort semantics win and the finalized assistant message remains `aborted`.
 
 ### Events
 
@@ -338,6 +354,8 @@ When steering messages are detected after a turn completes:
 3. The LLM responds on the next turn
 
 Follow-up messages are checked only when there are no more tool calls and no steering messages. If any are queued, they are injected and another turn runs.
+
+If the run is interrupted before that next turn begins, the current turn still emits `turn_end`, but the loop stops before polling steering or follow-up queues again. Any queued steering or follow-up messages remain queued for the next `prompt()` or `continue()` call.
 
 ## Custom Message Types
 

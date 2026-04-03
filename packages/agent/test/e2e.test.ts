@@ -10,8 +10,9 @@ import {
 	type ToolResultMessage,
 	type UserMessage,
 } from "@mariozechner/pi-ai";
+import { Type } from "@sinclair/typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { Agent, type AgentEvent } from "../src/index.js";
+import { Agent, type AgentEvent, type AgentTool } from "../src/index.js";
 import { calculateTool } from "./utils/calculate.js";
 
 const registrations: FauxProviderRegistration[] = [];
@@ -209,6 +210,125 @@ describe("Agent integration with faux provider", () => {
 			),
 		]);
 		await abortExecution(faux.getModel());
+	});
+
+	it("records interrupted assistant turns distinctly from aborted turns", async () => {
+		const faux = createFauxRegistration({
+			tokensPerSecond: 20,
+			tokenSize: { min: 2, max: 2 },
+		});
+		const model = faux.getModel();
+		const responseText = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen";
+
+		const interruptedAgent = new Agent({
+			initialState: {
+				systemPrompt: "You are a helpful assistant.",
+				model,
+				thinkingLevel: "off",
+				tools: [],
+			},
+		});
+		faux.setResponses([fauxAssistantMessage(responseText)]);
+		const interruptedPrompt = interruptedAgent.prompt("Count slowly from 1 to 20.");
+		setTimeout(() => {
+			interruptedAgent.interrupt();
+		}, 30);
+		await interruptedPrompt;
+
+		const interruptedMessage = interruptedAgent.state.messages[interruptedAgent.state.messages.length - 1];
+		if (interruptedMessage.role !== "assistant") throw new Error("Expected assistant message");
+		expect(interruptedMessage.stopReason).toBe("interrupted");
+
+		const abortedAgent = new Agent({
+			initialState: {
+				systemPrompt: "You are a helpful assistant.",
+				model,
+				thinkingLevel: "off",
+				tools: [],
+			},
+		});
+		faux.setResponses([fauxAssistantMessage(responseText)]);
+		const abortedPrompt = abortedAgent.prompt("Count slowly from 1 to 20.");
+		setTimeout(() => {
+			abortedAgent.abort();
+		}, 30);
+		await abortedPrompt;
+
+		const abortedMessage = abortedAgent.state.messages[abortedAgent.state.messages.length - 1];
+		if (abortedMessage.role !== "assistant") throw new Error("Expected assistant message");
+		expect(abortedMessage.stopReason).toBe("aborted");
+		expect(abortedMessage.errorMessage).toBeDefined();
+	});
+
+	it("winds down tool execution after interruption without starting another turn", async () => {
+		const faux = createFauxRegistration();
+		faux.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxText("Let me handle that."),
+					fauxToolCall("slow_echo", { value: "first" }, { id: "tool-1" }),
+					fauxToolCall("slow_echo", { value: "second" }, { id: "tool-2" }),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("This response should not run."),
+		]);
+
+		let releaseFirstTool: (() => void) | undefined;
+		const firstToolCanFinish = new Promise<void>((resolve) => {
+			releaseFirstTool = resolve;
+		});
+		let resolveFirstToolStarted: (() => void) | undefined;
+		const firstToolStarted = new Promise<void>((resolve) => {
+			resolveFirstToolStarted = resolve;
+		});
+		const executed: string[] = [];
+		const slowEchoSchema = Type.Object({ value: Type.String() });
+		const slowEchoTool: AgentTool<typeof slowEchoSchema, { value: string }> = {
+			name: "slow_echo",
+			label: "Slow echo",
+			description: "Slow echo tool",
+			parameters: slowEchoSchema,
+			async execute(_toolCallId: string, params) {
+				executed.push(params.value);
+				if (params.value === "first") {
+					resolveFirstToolStarted?.();
+					await firstToolCanFinish;
+				}
+				return {
+					content: [{ type: "text" as const, text: params.value }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "You are a helpful assistant.",
+				model: faux.getModel(),
+				thinkingLevel: "off",
+				tools: [slowEchoTool],
+			},
+			toolExecution: "sequential",
+		});
+
+		const promptPromise = agent.prompt("Run the tool twice.");
+		await firstToolStarted;
+		agent.interrupt();
+		releaseFirstTool?.();
+		await promptPromise;
+
+		expect(executed).toEqual(["first"]);
+		expect(agent.state.isStreaming).toBe(false);
+		expect(agent.state.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+
+		const toolResults = agent.state.messages.filter((message) => message.role === "toolResult");
+		expect(toolResults).toHaveLength(2);
+		expect(toolResults.map((message) => ({ id: message.toolCallId, isError: message.isError }))).toEqual([
+			{ id: "tool-1", isError: false },
+			{ id: "tool-2", isError: true },
+		]);
+		expect(getTextContent(toolResults[1])).toContain("Tool execution was blocked: session interrupted");
 	});
 
 	it("emits lifecycle updates while streaming", async () => {

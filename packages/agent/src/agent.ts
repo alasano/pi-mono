@@ -119,6 +119,13 @@ class PendingMessageQueue {
 		this.messages.push(message);
 	}
 
+	prepend(messages: AgentMessage[]): void {
+		if (messages.length === 0) {
+			return;
+		}
+		this.messages = [...messages, ...this.messages];
+	}
+
 	hasItems(): boolean {
 		return this.messages.length > 0;
 	}
@@ -353,7 +360,7 @@ export class Agent {
 
 			const queuedFollowUps = this.followUpQueue.drain();
 			if (queuedFollowUps.length > 0) {
-				await this.runPromptMessages(queuedFollowUps);
+				await this.runPromptMessages(queuedFollowUps, { skipInitialSteeringPoll: true });
 				return;
 			}
 
@@ -384,13 +391,13 @@ export class Agent {
 
 	private async runPromptMessages(
 		messages: AgentMessage[],
-		options: { skipInitialSteeringPoll?: boolean } = {},
+		overrides?: Partial<Pick<AgentLoopConfig, "skipInitialSteeringPoll">>,
 	): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoop(
 				messages,
 				this.createContextSnapshot(),
-				this.createLoopConfig(options),
+				{ ...this.createLoopConfig(), ...overrides },
 				(event) => this.processEvents(event),
 				signal,
 				this.streamFn,
@@ -418,8 +425,7 @@ export class Agent {
 		};
 	}
 
-	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
-		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
+	private createLoopConfig(): AgentLoopConfig {
 		return {
 			model: this._state.model,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
@@ -435,14 +441,10 @@ export class Agent {
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,
-			getSteeringMessages: async () => {
-				if (skipInitialSteeringPoll) {
-					skipInitialSteeringPoll = false;
-					return [];
-				}
-				return this.steeringQueue.drain();
-			},
+			getSteeringMessages: async () => this.steeringQueue.drain(),
+			requeueSteeringMessages: (messages) => this.steeringQueue.prepend(messages),
 			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			requeueFollowUpMessages: (messages) => this.followUpQueue.prepend(messages),
 			interruptSignal: this.activeRun?.interruptController.signal,
 			isInterrupted: () => this.activeRun?.interrupted ?? false,
 		};

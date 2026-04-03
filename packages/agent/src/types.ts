@@ -177,6 +177,21 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
 
 	/**
+	 * Skips the initial steering poll before the first assistant turn.
+	 *
+	 * Leave this unset for normal prompt and continuation runs. It exists for higher-level
+	 * wrappers that already pulled the next queued message and want later queue polls to remain unchanged.
+	 */
+	skipInitialSteeringPoll?: boolean;
+
+	/**
+	 * Restores steering messages when polling completed but the run exits before consuming them.
+	 *
+	 * Use this when `getSteeringMessages` removes messages from an owned queue.
+	 */
+	requeueSteeringMessages?: (messages: AgentMessage[]) => void;
+
+	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
 	 *
 	 * Called when the agent has no more tool calls and no steering messages.
@@ -188,6 +203,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Contract: must not throw or reject. Return [] when no follow-up messages are available.
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
+
+	/**
+	 * Restores follow-up messages when polling completed but the run exits before consuming them.
+	 *
+	 * Use this when `getFollowUpMessages` removes messages from an owned queue.
+	 */
+	requeueFollowUpMessages?: (messages: AgentMessage[]) => void;
 
 	/**
 	 * Tool execution mode.

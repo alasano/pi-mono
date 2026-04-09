@@ -238,6 +238,7 @@ describe("Agent integration with faux provider", () => {
 		const interruptedMessage = interruptedAgent.state.messages[interruptedAgent.state.messages.length - 1];
 		if (interruptedMessage.role !== "assistant") throw new Error("Expected assistant message");
 		expect(interruptedMessage.stopReason).toBe("interrupted");
+		expect(interruptedMessage.errorMessage).toBeUndefined();
 
 		const abortedAgent = new Agent({
 			initialState: {

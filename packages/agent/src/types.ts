@@ -229,6 +229,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 
 	/**
 	 * Optional callback that reports whether the current run has been interrupted.
+	 *
+	 * Contract: must not throw. If the callback throws, the error propagates
+	 * unhandled to the caller.
 	 */
 	isInterrupted?: () => boolean;
 

@@ -383,6 +383,7 @@ function normalizeAssistantStopReason(message: AssistantMessage, abortState: Ass
 	return {
 		...message,
 		stopReason: "interrupted",
+		errorMessage: undefined,
 	};
 }
 

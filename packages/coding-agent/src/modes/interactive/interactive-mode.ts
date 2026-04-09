@@ -116,6 +116,12 @@ import {
 	type ThemeColor,
 	theme,
 } from "./theme/theme.js";
+import {
+	type PendingToolResult,
+	ToolGroupController,
+	type ToolGroupControllerState,
+	type ToolGroupState,
+} from "./tool-group-controller.js";
 
 /** Interface for components that can be expanded/collapsed */
 interface Expandable {
@@ -145,19 +151,6 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
 
 type AssistantContent = Exclude<AssistantMessage["content"], string>;
 type AssistantContentBlock = AssistantContent[number];
-type PendingToolComponent = ToolExecutionComponent | ToolGroupComponent;
-type PendingToolResult = {
-	content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
-	details?: unknown;
-	isError: boolean;
-};
-type ToolGroupState = {
-	component: ToolGroupComponent;
-	definition: ToolGroupDefinition;
-};
-type ReplayToolGroupState = ToolGroupState & {
-	pendingMembers: Array<{ id: string; name: string; args: unknown }>;
-};
 
 /**
  * Options for InteractiveMode initialization.
@@ -222,6 +215,7 @@ export class InteractiveMode {
 	private openGroup: ToolGroupState | null = null;
 	private lastProcessedContentIndex = 0;
 	private emptyTextBlockIndices = new Set<number>();
+	private toolGroupController: ToolGroupController | undefined = undefined;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -1390,258 +1384,111 @@ export class InteractiveMode {
 		return undefined;
 	}
 
+	private getToolGroupController(): ToolGroupController {
+		if (!this.toolGroupController) {
+			const self = this;
+			const state: ToolGroupControllerState = {
+				get pendingTools() {
+					return self.pendingTools;
+				},
+				set pendingTools(value) {
+					self.pendingTools = value;
+				},
+				get openGroup() {
+					return self.openGroup;
+				},
+				set openGroup(value) {
+					self.openGroup = value;
+				},
+				get lastProcessedContentIndex() {
+					return self.lastProcessedContentIndex;
+				},
+				set lastProcessedContentIndex(value) {
+					self.lastProcessedContentIndex = value;
+				},
+				get emptyTextBlockIndices() {
+					return self.emptyTextBlockIndices;
+				},
+				set emptyTextBlockIndices(value) {
+					self.emptyTextBlockIndices = value;
+				},
+			};
+
+			this.toolGroupController = new ToolGroupController(
+				{
+					ui: this.ui,
+					chatContainer: this.chatContainer,
+					getShowImages: () => this.settingsManager.getShowImages(),
+					getToolOutputExpanded: () => this.toolOutputExpanded,
+					getCwd: () => (this.sessionManager as SessionManager | undefined)?.getCwd?.() ?? process.cwd(),
+					getRegisteredToolDefinition: (toolName) => this.getRegisteredToolDefinition(toolName),
+					findMatchingGroupDefinition: (toolName, args) => this.findMatchingGroupDefinition(toolName, args),
+				},
+				state,
+			);
+		}
+		return this.toolGroupController;
+	}
+
 	private closeOpenGroup(): void {
-		if (!this.openGroup) return;
-		this.openGroup.component.close();
-		this.openGroup = null;
+		this.getToolGroupController().closeOpenGroup();
 	}
 
 	private getToolGroupScope(definition: ToolGroupDefinition): "message" | "toolRun" {
-		return definition.lifecycle?.scope ?? "message";
-	}
-
-	private tryContinueToolRunGroup(
-		group: ToolGroupState,
-		toolName: string,
-		args: unknown,
-		onMatch: () => void,
-		closeGroup: () => void,
-		context: string,
-	): boolean {
-		if (this.getToolGroupScope(group.definition) !== "toolRun") {
-			return false;
-		}
-
-		try {
-			if (group.definition.match(toolName, args)) {
-				onMatch();
-				return true;
-			}
-		} catch (error) {
-			console.warn(`Tool group '${group.definition.name}' match() threw during ${context}:`, error);
-		}
-
-		closeGroup();
-		return false;
+		return this.getToolGroupController().getToolGroupScope(definition);
 	}
 
 	private resetStreamingContentIndex(): void {
-		this.lastProcessedContentIndex = 0;
-		this.emptyTextBlockIndices.clear();
+		this.getToolGroupController().resetStreamingContentIndex();
 	}
 
 	private resetStreamingToolTracking(): void {
-		this.closeOpenGroup();
-		this.resetStreamingContentIndex();
+		this.getToolGroupController().resetStreamingToolTracking();
 	}
 
-	private isGroupBoundary(block: AssistantContentBlock): boolean {
-		return block.type === "thinking" || (block.type === "text" && !!block.text?.trim());
-	}
-
-	private createToolExecutionComponent(toolName: string, toolCallId: string, args: unknown): ToolExecutionComponent {
-		const component = new ToolExecutionComponent(
-			toolName,
-			toolCallId,
-			args,
-			{
-				showImages: this.settingsManager.getShowImages(),
-			},
-			this.getRegisteredToolDefinition(toolName),
-			this.ui,
-			this.sessionManager.getCwd(),
-		);
-		component.setExpanded(this.toolOutputExpanded);
-		this.chatContainer.addChild(component);
-		return component;
-	}
-
-	private createOrExtendGroup(
+	private routeToolCallToPendingComponent(
 		toolName: string,
 		toolCallId: string,
 		args: unknown,
-		definition: ToolGroupDefinition,
-	): ToolGroupComponent {
-		if (this.openGroup?.definition === definition) {
-			this.openGroup.component.addMember(toolCallId, toolName, args);
-			return this.openGroup.component;
-		}
-
-		this.closeOpenGroup();
-
-		const groupComponent = new ToolGroupComponent(this.ui, definition, {
-			showImages: this.settingsManager.getShowImages(),
-		});
-		groupComponent.setExpanded(this.toolOutputExpanded);
-		groupComponent.addMember(toolCallId, toolName, args);
-		this.chatContainer.addChild(groupComponent);
-		this.openGroup = { component: groupComponent, definition };
-		return groupComponent;
-	}
-
-	private ensurePendingToolComponent(toolName: string, toolCallId: string, args: unknown): PendingToolComponent {
-		const existingComponent = this.pendingTools.get(toolCallId);
-		if (existingComponent) {
-			return existingComponent;
-		}
-
-		const openGroup = this.openGroup;
-		if (
-			openGroup &&
-			this.tryContinueToolRunGroup(
-				openGroup,
-				toolName,
-				args,
-				() => {
-					openGroup.component.addMember(toolCallId, toolName, args);
-					this.pendingTools.set(toolCallId, openGroup.component);
-				},
-				() => this.closeOpenGroup(),
-				"continuation",
-			)
-		) {
-			return openGroup.component;
-		}
-
-		const groupDefinition = this.findMatchingGroupDefinition(toolName, args);
-		if (!groupDefinition) {
-			this.closeOpenGroup();
-		}
-		const component = groupDefinition
-			? this.createOrExtendGroup(toolName, toolCallId, args, groupDefinition)
-			: this.createToolExecutionComponent(toolName, toolCallId, args);
-		this.pendingTools.set(toolCallId, component);
-		return component;
+		context: string = "continuation",
+	): ToolExecutionComponent | ToolGroupComponent {
+		return this.getToolGroupController().routeToolCallToPendingComponent(toolName, toolCallId, args, context);
 	}
 
 	private updatePendingToolArgs(toolCallId: string, args: unknown): void {
-		const component = this.pendingTools.get(toolCallId);
-		if (!component) return;
-		if (component instanceof ToolGroupComponent) {
-			component.updateMemberArgs(toolCallId, args);
-		} else {
-			component.updateArgs(args);
-		}
+		this.getToolGroupController().updatePendingToolArgs(toolCallId, args);
 	}
 
 	private markPendingToolExecutionStarted(toolCallId: string): void {
-		const component = this.pendingTools.get(toolCallId);
-		if (!component) return;
-		if (component instanceof ToolGroupComponent) {
-			component.markMemberExecutionStarted(toolCallId);
-		} else {
-			component.markExecutionStarted();
-		}
+		this.getToolGroupController().markPendingToolExecutionStarted(toolCallId);
 	}
 
 	private updatePendingToolResult(toolCallId: string, result: PendingToolResult, isPartial: boolean): void {
-		const component = this.pendingTools.get(toolCallId);
-		if (!component) return;
-		if (component instanceof ToolGroupComponent) {
-			component.updateMemberResult(toolCallId, result, isPartial);
-		} else {
-			component.updateResult(result, isPartial);
-		}
-	}
-
-	private forEachPendingToolBatch(options: {
-		individual: (component: ToolExecutionComponent) => void;
-		grouped: (component: ToolGroupComponent, toolCallIds: string[]) => void;
-	}): void {
-		const groupUpdates = new Map<ToolGroupComponent, string[]>();
-		for (const [toolCallId, component] of this.pendingTools.entries()) {
-			if (component instanceof ToolGroupComponent) {
-				const ids = groupUpdates.get(component) ?? [];
-				ids.push(toolCallId);
-				groupUpdates.set(component, ids);
-				continue;
-			}
-			options.individual(component);
-		}
-
-		for (const [groupComponent, toolCallIds] of groupUpdates) {
-			options.grouped(groupComponent, toolCallIds);
-		}
+		this.getToolGroupController().updatePendingToolResult(toolCallId, result, isPartial);
 	}
 
 	private setPendingToolsErrorResult(result: PendingToolResult): void {
-		this.forEachPendingToolBatch({
-			individual: (component) => {
-				component.updateResult(result);
-			},
-			grouped: (groupComponent, toolCallIds) => {
-				groupComponent.batchUpdate(() => {
-					for (const toolCallId of toolCallIds) {
-						groupComponent.updateMemberResult(toolCallId, result, false);
-					}
-				});
-			},
-		});
+		this.getToolGroupController().setPendingToolsErrorResult(result);
 	}
 
 	private finalizePendingToolArgs(): void {
-		this.forEachPendingToolBatch({
-			individual: (component) => {
-				component.setArgsComplete();
-			},
-			grouped: (groupComponent, toolCallIds) => {
-				groupComponent.batchUpdate(() => {
-					for (const toolCallId of toolCallIds) {
-						groupComponent.setMemberArgsComplete(toolCallId);
-					}
-				});
-			},
-		});
+		this.getToolGroupController().finalizePendingToolArgs();
 	}
 
-	private refreshProcessedStreamingBlock(block: AssistantContentBlock, index: number): void {
-		if (block.type === "toolCall") {
-			this.updatePendingToolArgs(block.id, block.arguments);
-		} else if (
-			this.openGroup &&
-			this.getToolGroupScope(this.openGroup.definition) === "toolRun" &&
-			block.type === "text" &&
-			this.emptyTextBlockIndices.has(index) &&
-			block.text?.trim()
-		) {
-			this.emptyTextBlockIndices.delete(index);
-			this.closeOpenGroup();
-		}
+	private reconcileProcessedStreamingBlock(block: AssistantContentBlock, index: number): void {
+		this.getToolGroupController().reconcileProcessedStreamingBlock(block, index);
 	}
 
 	private processNewStreamingBlock(block: AssistantContentBlock, index: number): void {
-		if (block.type === "toolCall") {
-			if (this.pendingTools.has(block.id)) {
-				this.updatePendingToolArgs(block.id, block.arguments);
-			} else {
-				this.ensurePendingToolComponent(block.name, block.id, block.arguments);
-			}
-			return;
-		}
-
-		if (block.type === "text" && !block.text?.trim()) {
-			this.emptyTextBlockIndices.add(index);
-		}
-
-		if (this.isGroupBoundary(block)) {
-			this.closeOpenGroup();
-		}
+		this.getToolGroupController().processNewStreamingBlock(block, index);
 	}
 
 	private processStreamingContent(content: AssistantContent): void {
-		const processedCount = Math.min(this.lastProcessedContentIndex, content.length);
-		for (let i = 0; i < processedCount; i++) {
-			this.refreshProcessedStreamingBlock(content[i], i);
-		}
-		for (let i = processedCount; i < content.length; i++) {
-			this.processNewStreamingBlock(content[i], i);
-		}
-		this.lastProcessedContentIndex = content.length;
+		this.getToolGroupController().onStreamingContentUpdate(content);
 	}
 
 	private clearPendingToolsAndGroup(): void {
-		this.resetStreamingToolTracking();
-		this.pendingTools.clear();
+		this.getToolGroupController().clearPendingToolsAndGroup();
 	}
 
 	/**
@@ -2666,10 +2513,7 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
-					this.resetStreamingContentIndex();
-					if (this.openGroup && this.getToolGroupScope(this.openGroup.definition) === "message") {
-						this.closeOpenGroup();
-					}
+					this.getToolGroupController().onAssistantMessageStart();
 					this.streamingComponent = new AssistantMessageComponent(
 						undefined,
 						this.hideThinkingBlock,
@@ -2707,27 +2551,13 @@ export class InteractiveMode {
 					}
 					this.streamingComponent.updateContent(this.streamingMessage);
 
-					if (this.streamingMessage.stopReason === "aborted" || this.streamingMessage.stopReason === "error") {
-						if (!errorMessage) {
-							errorMessage = this.streamingMessage.errorMessage || "Error";
-						}
-						const errorResult: PendingToolResult = {
-							content: [{ type: "text", text: errorMessage }],
-							isError: true,
-						};
-						this.setPendingToolsErrorResult(errorResult);
-						this.clearPendingToolsAndGroup();
-					} else {
-						// Args are now complete - trigger diff computation for edit tools
-						this.finalizePendingToolArgs();
-
-						const openScope = this.openGroup ? this.getToolGroupScope(this.openGroup.definition) : "message";
-						if (this.streamingMessage.stopReason === "toolUse" && openScope === "toolRun") {
-							this.resetStreamingContentIndex();
-						} else {
-							this.resetStreamingToolTracking();
-						}
+					if (!errorMessage) {
+						errorMessage = this.streamingMessage.errorMessage;
 					}
+					this.getToolGroupController().onAssistantMessageEnd({
+						stopReason: this.streamingMessage.stopReason,
+						errorMessage,
+					});
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
@@ -2736,24 +2566,30 @@ export class InteractiveMode {
 				break;
 
 			case "tool_execution_start": {
-				this.ensurePendingToolComponent(event.toolName, event.toolCallId, event.args);
-				this.markPendingToolExecutionStarted(event.toolCallId);
+				this.getToolGroupController().onToolExecutionStart(event.toolCallId, event.toolName, event.args);
 				this.ui.requestRender();
 				break;
 			}
 
 			case "tool_execution_update": {
-				if (this.pendingTools.has(event.toolCallId)) {
-					this.updatePendingToolResult(event.toolCallId, { ...event.partialResult, isError: false }, true);
+				if (
+					this.getToolGroupController().onToolExecutionUpdate(event.toolCallId, {
+						...event.partialResult,
+						isError: false,
+					})
+				) {
 					this.ui.requestRender();
 				}
 				break;
 			}
 
 			case "tool_execution_end": {
-				if (this.pendingTools.has(event.toolCallId)) {
-					this.updatePendingToolResult(event.toolCallId, { ...event.result, isError: event.isError }, false);
-					this.pendingTools.delete(event.toolCallId);
+				if (
+					this.getToolGroupController().onToolExecutionEnd(event.toolCallId, {
+						...event.result,
+						isError: event.isError,
+					})
+				) {
 					this.ui.requestRender();
 				}
 				break;
@@ -3018,212 +2854,59 @@ export class InteractiveMode {
 		sessionContext: SessionContext,
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
-		this.clearPendingToolsAndGroup();
+		const toolGroupController = this.getToolGroupController();
+		toolGroupController.clearPendingToolsAndGroup();
 
 		if (options.updateFooter) {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 		}
 
-		const groupComponentsWithResults = new Set<ToolGroupComponent>();
 		const pendingToolErrors = new Map<string, string>();
 
-		let replayActiveGroup: ReplayToolGroupState | null = null;
-
-		const flushReplayGroup = () => {
-			if (replayActiveGroup && replayActiveGroup.pendingMembers.length > 0) {
-				const group = replayActiveGroup;
-				group.component.batchUpdate(() => {
-					for (const member of group.pendingMembers) {
-						group.component.addMember(member.id, member.name, member.args);
-						group.component.setMemberArgsComplete(member.id);
-						group.component.markMemberExecutionStarted(member.id);
-					}
-				});
-				group.pendingMembers = [];
-			}
-		};
-
-		const closeReplayGroup = () => {
-			if (replayActiveGroup) {
-				flushReplayGroup();
-				replayActiveGroup.component.close();
-				replayActiveGroup = null;
-			}
-		};
-
 		for (const message of sessionContext.messages) {
-			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				this.addMessageToChat(message);
+				const assistantContent: AssistantContent =
+					typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
+				toolGroupController.onReplayAssistantMessage(
+					{
+						content: assistantContent,
+						stopReason: message.stopReason,
+						errorMessage: message.errorMessage,
+					},
+					this.session.retryAttempt,
+					pendingToolErrors,
+				);
+				continue;
+			}
 
-				const isAbortedOrError = message.stopReason === "aborted" || message.stopReason === "error";
-
-				let errorMessage: string | undefined;
-				if (isAbortedOrError) {
-					if (message.stopReason === "aborted") {
-						const retryAttempt = this.session.retryAttempt;
-						errorMessage =
-							retryAttempt > 0
-								? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
-								: "Operation aborted";
-					} else {
-						errorMessage = message.errorMessage || "Error";
-					}
-				}
-
-				for (const content of message.content) {
-					if (content.type === "toolCall") {
-						const replayGroup = replayActiveGroup;
-						if (
-							replayGroup &&
-							this.tryContinueToolRunGroup(
-								replayGroup,
-								content.name,
-								content.arguments,
-								() => {
-									replayGroup.pendingMembers.push({
-										id: content.id,
-										name: content.name,
-										args: content.arguments,
-									});
-									this.pendingTools.set(content.id, replayGroup.component);
-									if (errorMessage) {
-										pendingToolErrors.set(content.id, errorMessage);
-									}
-								},
-								closeReplayGroup,
-								"replay continuation",
-							)
-						) {
-							continue;
-						}
-
-						const groupDef = this.findMatchingGroupDefinition(content.name, content.arguments);
-
-						if (groupDef) {
-							if (replayActiveGroup && replayActiveGroup.definition === groupDef) {
-								replayActiveGroup.pendingMembers.push({
-									id: content.id,
-									name: content.name,
-									args: content.arguments,
-								});
-								this.pendingTools.set(content.id, replayActiveGroup.component);
-							} else {
-								closeReplayGroup();
-								const groupComponent: ToolGroupComponent = new ToolGroupComponent(this.ui, groupDef, {
-									showImages: this.settingsManager.getShowImages(),
-								});
-								groupComponent.setExpanded(this.toolOutputExpanded);
-								this.chatContainer.addChild(groupComponent);
-								replayActiveGroup = {
-									component: groupComponent,
-									definition: groupDef,
-									pendingMembers: [{ id: content.id, name: content.name, args: content.arguments }],
-								};
-								this.pendingTools.set(content.id, groupComponent);
-							}
-						} else {
-							closeReplayGroup();
-							const component = new ToolExecutionComponent(
-								content.name,
-								content.id,
-								content.arguments,
-								{ showImages: this.settingsManager.getShowImages() },
-								this.getRegisteredToolDefinition(content.name),
-								this.ui,
-								this.sessionManager.getCwd(),
-							);
-							component.setExpanded(this.toolOutputExpanded);
-							this.chatContainer.addChild(component);
-							this.pendingTools.set(content.id, component);
-						}
-
-						if (errorMessage) {
-							pendingToolErrors.set(content.id, errorMessage);
-						}
-					} else {
-						const isTextWithContent = content.type === "text" && (content as { text?: string }).text?.trim();
-						const isThinking = content.type === "thinking";
-						if (isTextWithContent || isThinking) {
-							closeReplayGroup();
-						}
-					}
-				}
-
-				if (replayActiveGroup) {
-					const replayScope = this.getToolGroupScope(replayActiveGroup.definition);
-					if (replayScope === "toolRun" && message.stopReason === "toolUse") {
-						flushReplayGroup();
-					} else {
-						closeReplayGroup();
-					}
-				}
-			} else if (message.role === "toolResult") {
-				const component = this.pendingTools.get(message.toolCallId);
-				if (component) {
-					if (component instanceof ToolGroupComponent) {
-						component.populateMemberResult(message.toolCallId, message);
-						groupComponentsWithResults.add(component);
-					} else {
-						(component as ToolExecutionComponent).updateResult(message);
-					}
-					this.pendingTools.delete(message.toolCallId);
+			if (message.role === "toolResult") {
+				if (
+					toolGroupController.onReplayToolResult(message.toolCallId, {
+						content: message.content,
+						details: "details" in message ? message.details : undefined,
+						isError: message.isError,
+					})
+				) {
 					pendingToolErrors.delete(message.toolCallId);
 				}
-			} else {
-				closeReplayGroup();
-				this.addMessageToChat(message, options);
+				continue;
 			}
+
+			toolGroupController.closeOpenGroup();
+			this.addMessageToChat(message, options);
 		}
 
-		closeReplayGroup();
+		toolGroupController.closeOpenGroup();
 
-		// Inject error results into remaining pendingTools entries (tool calls from aborted/error
-		// messages that had no matching toolResult). Preserves actual results for completed calls.
-		const errorInjectedGroups = new Set<ToolGroupComponent>();
-		if (this.pendingTools.size > 0) {
-			const groupUpdates = new Map<ToolGroupComponent, string[]>();
-			for (const [toolCallId, component] of this.pendingTools.entries()) {
-				if (component instanceof ToolGroupComponent) {
-					let ids = groupUpdates.get(component);
-					if (!ids) {
-						ids = [];
-						groupUpdates.set(component, ids);
-					}
-					ids.push(toolCallId);
-				} else {
-					const errorMsg = pendingToolErrors.get(toolCallId) || "Operation aborted";
-					(component as ToolExecutionComponent).updateResult({
-						content: [{ type: "text", text: errorMsg }],
-						isError: true,
-					});
-				}
-			}
-			for (const [groupComponent, toolCallIds] of groupUpdates) {
-				groupComponent.batchUpdate(() => {
-					for (const toolCallId of toolCallIds) {
-						const errorMsg = pendingToolErrors.get(toolCallId) || "Operation aborted";
-						groupComponent.updateMemberResult(
-							toolCallId,
-							{ content: [{ type: "text", text: errorMsg }], isError: true },
-							false,
-						);
-					}
-				});
-				errorInjectedGroups.add(groupComponent);
-			}
+		if (toolGroupController.pendingTools.size > 0) {
+			toolGroupController.injectPendingToolErrors((toolCallId) => {
+				return pendingToolErrors.get(toolCallId) || "Operation aborted";
+			});
 		}
 
-		// Trigger a single render for each ToolGroupComponent that received results via populateMemberResult,
-		// skipping any that were already rendered during error injection above
-		for (const groupComponent of groupComponentsWithResults) {
-			if (!errorInjectedGroups.has(groupComponent)) {
-				groupComponent.batchUpdate(() => {});
-			}
-		}
-
-		this.clearPendingToolsAndGroup();
+		toolGroupController.clearPendingToolsAndGroup();
 		this.ui.requestRender();
 	}
 

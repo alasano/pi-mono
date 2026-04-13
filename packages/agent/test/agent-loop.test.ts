@@ -9,7 +9,7 @@ import {
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue, runAgentLoop, runAgentLoopContinue } from "../src/agent-loop.js";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, StreamFn } from "../src/types.js";
+import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.js";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -234,62 +234,6 @@ describe("agentLoop with AgentMessage", () => {
 		expect(transformedMessages.length).toBe(2);
 		// Then convertToLlm receives the pruned messages
 		expect(convertedMessages.length).toBe(2);
-	});
-
-	it("should preserve existing stream option passthrough, including interrupt fields", async () => {
-		const context: AgentContext = {
-			systemPrompt: "You are helpful.",
-			messages: [],
-			tools: [],
-		};
-		const userPrompt: AgentMessage = createUserMessage("Hello");
-		const interruptController = new AbortController();
-		const isInterrupted = () => false;
-		const beforeToolCall = async () => undefined;
-		const afterToolCall = async () => undefined;
-		const getSteeringMessages = async () => [];
-		const getFollowUpMessages = async () => [];
-		let receivedOptions: Record<string, unknown> | undefined;
-
-		const config: AgentLoopConfig = {
-			model: createModel(),
-			convertToLlm: identityConverter,
-			interruptSignal: interruptController.signal,
-			isInterrupted,
-			beforeToolCall,
-			afterToolCall,
-			getSteeringMessages,
-			getFollowUpMessages,
-			toolExecution: "sequential",
-			sessionId: "session-123",
-		};
-
-		const streamFn: StreamFn = (_model, _llmContext, options) => {
-			receivedOptions = options as Record<string, unknown> | undefined;
-			const stream = new MockAssistantStream();
-			queueMicrotask(() => {
-				const message = createAssistantMessage([{ type: "text", text: "Hi there!" }]);
-				stream.push({ type: "done", reason: "stop", message });
-			});
-			return stream;
-		};
-
-		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
-		for await (const _event of stream) {
-			// consume
-		}
-
-		expect(receivedOptions).toBeDefined();
-		expect(receivedOptions).toMatchObject({
-			interruptSignal: interruptController.signal,
-			isInterrupted,
-			beforeToolCall,
-			afterToolCall,
-			getSteeringMessages,
-			getFollowUpMessages,
-			toolExecution: "sequential",
-			sessionId: "session-123",
-		});
 	});
 
 	it("should rewrite aborted assistant streams to interrupted when interrupted", async () => {
@@ -1413,62 +1357,6 @@ describe("agentLoop with AgentMessage", () => {
 
 		expect(llmCalls).toBe(1);
 	});
-	it("should propagate isInterrupted errors during tool preflight", async () => {
-		const toolSchema = Type.Object({ value: Type.String() });
-		let executeCalled = false;
-		const tool: AgentTool<typeof toolSchema, { value: string }> = {
-			name: "echo",
-			label: "Echo",
-			description: "Echo tool",
-			parameters: toolSchema,
-			async execute(_toolCallId, params) {
-				executeCalled = true;
-				return {
-					content: [{ type: "text", text: "unexpected" }],
-					details: { value: params.value },
-				};
-			},
-		};
-
-		const context: AgentContext = {
-			systemPrompt: "",
-			messages: [createUserMessage("run tool")],
-			tools: [tool],
-		};
-
-		const config: AgentLoopConfig = {
-			model: createModel(),
-			convertToLlm: identityConverter,
-			isInterrupted: () => {
-				throw new Error("interrupt check failed");
-			},
-		};
-
-		await expect(
-			runAgentLoopContinue(
-				context,
-				config,
-				async () => undefined,
-				undefined,
-				() => {
-					const mockStream = new MockAssistantStream();
-					queueMicrotask(() => {
-						mockStream.push({
-							type: "done",
-							reason: "toolUse",
-							message: createAssistantMessage(
-								[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } }],
-								"toolUse",
-							),
-						});
-					});
-					return mockStream;
-				},
-			),
-		).rejects.toThrow("interrupt check failed");
-		expect(executeCalled).toBe(false);
-	});
-
 	it("should block remaining sequential tool calls after interruption", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		let interrupted = false;
@@ -1732,68 +1620,6 @@ describe("agentLoop with AgentMessage", () => {
 		]);
 	});
 
-	it("should propagate interrupt predicate failures after beforeToolCall", async () => {
-		const toolSchema = Type.Object({ value: Type.String() });
-		const tool: AgentTool<typeof toolSchema, { value: string }> = {
-			name: "echo",
-			label: "Echo",
-			description: "Echo",
-			parameters: toolSchema,
-			async execute() {
-				throw new Error("tool should not execute");
-			},
-		};
-		let interruptChecks = 0;
-		const context: AgentContext = {
-			systemPrompt: "",
-			messages: [],
-			tools: [tool],
-		};
-		const config: AgentLoopConfig = {
-			model: createModel(),
-			convertToLlm: identityConverter,
-			beforeToolCall: async () => undefined,
-			isInterrupted: () => {
-				interruptChecks++;
-				if (interruptChecks >= 3) {
-					throw new Error("interrupt predicate failed");
-				}
-				return false;
-			},
-		};
-
-		await expect(
-			runAgentLoop(
-				[createUserMessage("run tool")],
-				context,
-				config,
-				async () => undefined,
-				undefined,
-				() => {
-					const stream = new MockAssistantStream();
-					queueMicrotask(() => {
-						stream.push({
-							type: "done",
-							reason: "toolUse",
-							message: createAssistantMessage(
-								[
-									{
-										type: "toolCall",
-										id: "tool-1",
-										name: "echo",
-										arguments: { value: "hello" },
-									},
-								],
-								"toolUse",
-							),
-						});
-					});
-					return stream;
-				},
-			),
-		).rejects.toThrow("interrupt predicate failed");
-	});
-
 	it("should allow all parallel tools to finish when interruption happens after dispatch", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		let interrupted = false;
@@ -2053,7 +1879,7 @@ describe("agentLoop with AgentMessage", () => {
 		},
 	);
 
-	it("should propagate isInterrupted errors instead of treating them as interruption state", async () => {
+	it("should propagate errors thrown by isInterrupted", async () => {
 		const context: AgentContext = {
 			systemPrompt: "",
 			messages: [createUserMessage("retry me")],

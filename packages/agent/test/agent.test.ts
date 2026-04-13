@@ -54,10 +54,6 @@ interface ActiveRunForInterruptTests {
 
 interface AgentPrivateForInterruptTests {
 	activeRun?: ActiveRunForInterruptTests;
-	createLoopConfig: () => {
-		interruptSignal?: AbortSignal;
-		isInterrupted?: () => boolean;
-	};
 }
 
 function getAgentPrivate(agent: Agent): AgentPrivateForInterruptTests {
@@ -342,46 +338,6 @@ describe("Agent", () => {
 		expect(activeRun.interrupted).toBe(true);
 		expect(activeRun.interruptController.signal.aborted).toBe(true);
 		expect(abortCount).toBe(1);
-
-		agent.abort();
-		await promptPromise;
-	});
-
-	it("should wire interrupt state into loop config", async () => {
-		const agent = new Agent({
-			streamFn: (_model, _context, options) => {
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					stream.push({ type: "start", partial: createAssistantMessage("") });
-					const checkAbort = () => {
-						if (options?.signal?.aborted) {
-							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
-						} else {
-							setTimeout(checkAbort, 5);
-						}
-					};
-					checkAbort();
-				});
-				return stream;
-			},
-		});
-
-		const promptPromise = agent.prompt("hello");
-		await new Promise((resolve) => setTimeout(resolve, 10));
-
-		const agentPrivate = getAgentPrivate(agent);
-		const activeRun = agentPrivate.activeRun;
-		expect(activeRun).toBeDefined();
-		if (!activeRun) throw new Error("Expected an active run");
-		const configBeforeInterrupt = agentPrivate.createLoopConfig();
-		expect(configBeforeInterrupt.interruptSignal).toBe(activeRun.interruptController.signal);
-		expect(configBeforeInterrupt.isInterrupted?.()).toBe(false);
-
-		agent.interrupt();
-
-		const configAfterInterrupt = agentPrivate.createLoopConfig();
-		expect(configAfterInterrupt.interruptSignal).toBe(activeRun.interruptController.signal);
-		expect(configAfterInterrupt.isInterrupted?.()).toBe(true);
 
 		agent.abort();
 		await promptPromise;

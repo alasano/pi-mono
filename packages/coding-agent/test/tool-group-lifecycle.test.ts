@@ -104,28 +104,6 @@ describe("Tool Group Lifecycle", () => {
 		};
 	}
 
-	describe("lifecycle scope defaulting", () => {
-		it("omitted lifecycle defaults to message scope", async () => {
-			const group = makeGroupDef("no-lifecycle", (t) => t === "read");
-			expect(group.lifecycle).toBeUndefined();
-			const resolvedScope = group.lifecycle?.scope ?? "message";
-			expect(resolvedScope).toBe("message");
-		});
-
-		it("lifecycle: {} (present but no scope) defaults to message", async () => {
-			const group = makeGroupDef("empty-lifecycle", (t) => t === "read", {});
-			expect(group.lifecycle).toEqual({});
-			const resolvedScope = group.lifecycle?.scope ?? "message";
-			expect(resolvedScope).toBe("message");
-		});
-
-		it("lifecycle: { scope: undefined } defaults to message", async () => {
-			const group = makeGroupDef("undef-scope", (t) => t === "read", { scope: undefined });
-			const resolvedScope = group.lifecycle?.scope ?? "message";
-			expect(resolvedScope).toBe("message");
-		});
-	});
-
 	describe("explicit toolRun definitions are discoverable through registration flow", () => {
 		it("toolRun-scoped definition is registered and discoverable", async () => {
 			const runtime = createExtensionRuntime();

@@ -10,7 +10,7 @@ import {
 	type ToolResultMessage,
 	type UserMessage,
 } from "@mariozechner/pi-ai";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { Agent, type AgentEvent, type AgentTool } from "../src/index.js";
 import { calculateTool } from "./utils/calculate.js";

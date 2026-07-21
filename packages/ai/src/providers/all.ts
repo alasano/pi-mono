@@ -29,6 +29,9 @@ import { opencodeProvider } from "./opencode.ts";
 import { opencodeGoProvider } from "./opencode-go.ts";
 import { openrouterProvider } from "./openrouter.ts";
 import { openrouterImagesProvider } from "./openrouter-images.ts";
+import { qwenTokenPlanProvider } from "./qwen-token-plan.ts";
+import { qwenTokenPlanCnProvider } from "./qwen-token-plan-cn.ts";
+import { radiusProvider } from "./radius.ts";
 import { togetherProvider } from "./together.ts";
 import { vercelAIGatewayProvider } from "./vercel-ai-gateway.ts";
 import { xaiProvider } from "./xai.ts";
@@ -38,6 +41,8 @@ import { xiaomiTokenPlanCnProvider } from "./xiaomi-token-plan-cn.ts";
 import { xiaomiTokenPlanSgpProvider } from "./xiaomi-token-plan-sgp.ts";
 import { zaiProvider } from "./zai.ts";
 import { zaiCodingCnProvider } from "./zai-coding-cn.ts";
+
+export { radiusProvider };
 
 /** Providers present in the generated catalog. `KnownProvider` additionally
  * includes purely dynamic providers (e.g. "radius") that have no static
@@ -60,6 +65,11 @@ export function getBuiltinModel<TProvider extends BuiltinProvider, TModelId exte
 
 export function getBuiltinProviders(): BuiltinProvider[] {
 	return Object.keys(MODELS) as BuiltinProvider[];
+}
+
+/** URL of a generated provider catalog, used to compare its mtime with remote catalogs during development. */
+export function getBuiltinModelDataUrl(provider: BuiltinProvider): URL {
+	return new URL(`./data/${provider}.json`, import.meta.url);
 }
 
 export function getBuiltinModels<TProvider extends BuiltinProvider>(
@@ -100,6 +110,9 @@ export function builtinProviders(): Provider[] {
 		opencodeProvider(),
 		opencodeGoProvider(),
 		openrouterProvider(),
+		qwenTokenPlanProvider(),
+		qwenTokenPlanCnProvider(),
+		radiusProvider(),
 		togetherProvider(),
 		vercelAIGatewayProvider(),
 		xaiProvider(),

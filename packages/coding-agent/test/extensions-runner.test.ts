@@ -8,11 +8,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { createExtensionRuntime, discoverAndLoadExtensions, loadExtensions } from "../src/core/extensions/loader.ts";
+import { createEventBus } from "../src/core/event-bus.ts";
+import {
+	createExtensionRuntime,
+	discoverAndLoadExtensions,
+	loadExtensionFromFactory,
+	loadExtensions,
+} from "../src/core/extensions/loader.ts";
 import { ExtensionRunner, emitProjectTrustEvent } from "../src/core/extensions/runner.ts";
 import type {
 	ExtensionActions,
 	ExtensionContextActions,
+	ExtensionFactory,
 	ExtensionUIContext,
 	ProviderConfig,
 } from "../src/core/extensions/types.ts";
@@ -927,6 +934,116 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.hasHandlers("tool_call")).toBe(true);
 			expect(runner.hasHandlers("agent_end")).toBe(false);
+		});
+	});
+
+	describe("ui_dialog events", () => {
+		const makeRunner = async (factory: ExtensionFactory, ui: Partial<ExtensionUIContext>) => {
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(factory, tempDir, createEventBus(), runtime);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+			runner.setUIContext(ui as ExtensionUIContext, "tui");
+			return runner;
+		};
+
+		it("emits paired events around each blocking primitive, in open order across interleaved dialogs", async () => {
+			const log: string[] = [];
+			let selectOpened!: () => void;
+			const selectOpen = new Promise<void>((resolve) => {
+				selectOpened = resolve;
+			});
+			let resolveSelect!: (value: string | undefined) => void;
+			const ui: Partial<ExtensionUIContext> = {
+				select: (title) => {
+					log.push(`open:${title}`);
+					selectOpened();
+					return new Promise((resolve) => {
+						resolveSelect = resolve;
+					});
+				},
+				confirm: async (title) => {
+					log.push(`open:${title}`);
+					return true;
+				},
+				editor: async (title) => {
+					log.push(`open:${title}`);
+					return "text";
+				},
+				custom: async () => {
+					log.push("open:custom");
+					return undefined as never;
+				},
+			};
+			const runner = await makeRunner((pi) => {
+				pi.on("ui_dialog_start", (event) => {
+					log.push(`start:${event.dialog}:${event.dialogId}:${event.title ?? "-"}`);
+				});
+				pi.on("ui_dialog_end", (event) => {
+					log.push(`end:${event.dialog}:${event.dialogId}:${event.title ?? "-"}`);
+				});
+			}, ui);
+
+			const wrapped = runner.getUIContext();
+			const selectPromise = wrapped.select("Pick", ["a", "b"]);
+			await selectOpen;
+			expect(await wrapped.confirm("Sure?", "message")).toBe(true);
+			resolveSelect("a");
+			expect(await selectPromise).toBe("a");
+			expect(await wrapped.editor("Edit")).toBe("text");
+			await wrapped.custom(async () => ({ render: () => [], invalidate: () => {} }));
+
+			expect(log).toEqual([
+				"start:select:1:Pick",
+				"open:Pick",
+				"start:confirm:2:Sure?",
+				"open:Sure?",
+				"end:confirm:2:Sure?",
+				"end:select:1:Pick",
+				"start:editor:3:Edit",
+				"open:Edit",
+				"end:editor:3:Edit",
+				"start:custom:4:-",
+				"open:custom",
+				"end:custom:4:-",
+			]);
+		});
+
+		it("emits ui_dialog_end when the dialog rejects", async () => {
+			const events: string[] = [];
+			const ui: Partial<ExtensionUIContext> = {
+				input: async () => {
+					throw new Error("boom");
+				},
+			};
+			const runner = await makeRunner((pi) => {
+				pi.on("ui_dialog_start", (event) => {
+					events.push(`start:${event.dialog}`);
+				});
+				pi.on("ui_dialog_end", (event) => {
+					events.push(`end:${event.dialog}`);
+				});
+			}, ui);
+
+			await expect(runner.getUIContext().input("Name")).rejects.toThrow("boom");
+			expect(events).toEqual(["start:input", "end:input"]);
+		});
+
+		it("passes arguments and results through when no dialog handlers are registered", async () => {
+			const calls: unknown[][] = [];
+			const opts = { timeout: 5000 };
+			const ui: Partial<ExtensionUIContext> = {
+				select: async (...args) => {
+					calls.push(args);
+					return "b";
+				},
+			};
+			const runner = await makeRunner((pi) => {
+				pi.on("agent_start", () => {});
+			}, ui);
+
+			expect(await runner.getUIContext().select("Pick", ["a", "b"], opts)).toBe("b");
+			expect(calls).toEqual([["Pick", ["a", "b"], opts]]);
 		});
 	});
 

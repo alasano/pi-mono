@@ -41,6 +41,7 @@ See [examples/extensions/](../examples/extensions/) for working implementations.
   - [Session Events](#session-events)
   - [Agent Events](#agent-events)
   - [Model Events](#model-events)
+  - [UI Dialog Events](#ui-dialog-events)
   - [Tool Events](#tool-events)
 - [ExtensionContext](#extensioncontext)
 - [ExtensionCommandContext](#extensioncommandcontext)
@@ -342,6 +343,10 @@ user sends another prompt ◄─────────────────
 
 thinking level changes (settings, keybinding, pi.setThinkingLevel())
   └─► thinking_level_select
+
+extension dialog (ctx.ui.select / confirm / input / editor / custom)
+  ├─► ui_dialog_start
+  └─► ui_dialog_end (when the dialog settles)
 
 exit (Ctrl+C, Ctrl+D, SIGHUP, SIGTERM)
   └─► session_shutdown
@@ -745,6 +750,33 @@ pi.on("thinking_level_select", async (event, ctx) => {
 ```
 
 Use this to update extension UI when `pi.setThinkingLevel()`, model changes, or built-in thinking-level controls change the active thinking level.
+
+### UI Dialog Events
+
+#### ui_dialog_start / ui_dialog_end
+
+Fired when an extension opens one of the blocking UI primitives (`ctx.ui.select`, `ctx.ui.confirm`, `ctx.ui.input`, `ctx.ui.editor`, `ctx.ui.custom`) and when that dialog settles (answered, dismissed, or timed out). These are the only points where a session blocks awaiting user input without any other observable event. Notification-only; handlers cannot answer or dismiss the dialog.
+
+```typescript
+const pending = new Map<number, number>();
+
+pi.on("ui_dialog_start", async (event) => {
+  // event.dialog - "select" | "confirm" | "input" | "editor" | "custom"
+  // event.title - title passed by the extension that opened it (absent for custom)
+  // event.dialogId - pairs this start with its ui_dialog_end
+  pending.set(event.dialogId, Date.now());
+});
+
+pi.on("ui_dialog_end", async (event, ctx) => {
+  const openedAt = pending.get(event.dialogId);
+  pending.delete(event.dialogId);
+  if (openedAt !== undefined) {
+    ctx.ui.setStatus("dialog", `last dialog waited ${Date.now() - openedAt}ms`);
+  }
+});
+```
+
+Use this to notify a user who stepped away, show a waiting indicator, exclude dialog waits from timing measurements, or pause terminal-input handling while a dialog is up. Your own extension's dialogs fire these events too; never open a dialog from these handlers, as that recurses. Dialogs shown through the limited `project_trust` context do not emit these events.
 
 ### Tool Events
 

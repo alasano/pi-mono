@@ -800,6 +800,35 @@ export interface ThinkingLevelSelectEvent {
 }
 
 // ============================================================================
+// UI Dialog Events
+// ============================================================================
+
+/** The extension UI primitives that block awaiting user input. */
+export type UIDialogKind = "select" | "confirm" | "input" | "editor" | "custom";
+
+/** Fired when an extension UI dialog opens. Observational only: handlers cannot answer or dismiss the dialog, and must not open dialogs of their own. */
+export interface UIDialogStartEvent {
+	type: "ui_dialog_start";
+	/** Which dialog primitive opened. */
+	dialog: UIDialogKind;
+	/** The title passed by the extension that opened the dialog. Absent for custom(), which takes no title. */
+	title?: string;
+	/** Pairs this event with its ui_dialog_end. Monotonically increasing within the current session runtime. */
+	dialogId: number;
+}
+
+/** Fired when an extension UI dialog settles (answered, dismissed, or timed out). */
+export interface UIDialogEndEvent {
+	type: "ui_dialog_end";
+	/** Which dialog primitive settled. */
+	dialog: UIDialogKind;
+	/** The title passed by the extension that opened the dialog. Absent for custom(), which takes no title. */
+	title?: string;
+	/** Pairs this event with its ui_dialog_start. Monotonically increasing within the current session runtime. */
+	dialogId: number;
+}
+
+// ============================================================================
 // User Bash Events
 // ============================================================================
 
@@ -1047,6 +1076,8 @@ export type ExtensionEvent =
 	| ToolExecutionEndEvent
 	| ModelSelectEvent
 	| ThinkingLevelSelectEvent
+	| UIDialogStartEvent
+	| UIDialogEndEvent
 	| UserBashEvent
 	| InputEvent
 	| ToolCallEvent
@@ -1219,6 +1250,8 @@ export interface ExtensionAPI {
 	on(event: "tool_execution_end", handler: ExtensionHandler<ToolExecutionEndEvent>): void;
 	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): void;
 	on(event: "thinking_level_select", handler: ExtensionHandler<ThinkingLevelSelectEvent>): void;
+	on(event: "ui_dialog_start", handler: ExtensionHandler<UIDialogStartEvent>): void;
+	on(event: "ui_dialog_end", handler: ExtensionHandler<UIDialogEndEvent>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;

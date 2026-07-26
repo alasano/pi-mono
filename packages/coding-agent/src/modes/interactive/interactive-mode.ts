@@ -1779,9 +1779,10 @@ export class InteractiveMode {
 		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
 		if (shortcuts.size === 0) return;
 
-		// Create a context for shortcut handlers
+		// Create a context for shortcut handlers. The UI context comes from the runner
+		// so dialogs opened by shortcut handlers emit ui_dialog_start / ui_dialog_end.
 		const createContext = (): ExtensionContext => ({
-			ui: this.createExtensionUIContext(),
+			ui: extensionRunner.getUIContext(),
 			mode: "tui",
 			hasUI: true,
 			cwd: this.sessionManager.getCwd(),

@@ -60,6 +60,7 @@ import type {
 	ToolCallEventResult,
 	ToolResultEvent,
 	ToolResultEventResult,
+	UIDialogKind,
 	UserBashEvent,
 	UserBashEventResult,
 } from "./types.ts";
@@ -267,6 +268,7 @@ export class ExtensionRunner {
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
 	private uiContext: ExtensionUIContext;
+	private dialogCounter = 0;
 	private mode: ExtensionMode = "print";
 	private cwd: string;
 	private sessionManager: SessionManager;
@@ -427,8 +429,40 @@ export class ExtensionRunner {
 	}
 
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ?? noOpUIContext;
+		this.uiContext = uiContext ? this.withDialogEvents(uiContext) : noOpUIContext;
 		this.mode = mode;
+	}
+
+	/**
+	 * Wraps the blocking UI primitives so extensions can observe when the session blocks
+	 * awaiting user input (ui_dialog_start / ui_dialog_end). Copies via property
+	 * descriptors so accessor properties (e.g. theme) stay lazy instead of being read
+	 * once at wrap time.
+	 */
+	private withDialogEvents(ui: ExtensionUIContext): ExtensionUIContext {
+		const wrapped = Object.defineProperties({}, Object.getOwnPropertyDescriptors(ui)) as ExtensionUIContext;
+		wrapped.select = (title, options, opts) =>
+			this.trackDialog("select", title, () => ui.select(title, options, opts));
+		wrapped.confirm = (title, message, opts) =>
+			this.trackDialog("confirm", title, () => ui.confirm(title, message, opts));
+		wrapped.input = (title, placeholder, opts) =>
+			this.trackDialog("input", title, () => ui.input(title, placeholder, opts));
+		wrapped.editor = (title, prefill) => this.trackDialog("editor", title, () => ui.editor(title, prefill));
+		wrapped.custom = (factory, options) => this.trackDialog("custom", undefined, () => ui.custom(factory, options));
+		return wrapped;
+	}
+
+	private async trackDialog<T>(dialog: UIDialogKind, title: string | undefined, open: () => Promise<T>): Promise<T> {
+		if (!this.hasHandlers("ui_dialog_start") && !this.hasHandlers("ui_dialog_end")) {
+			return open();
+		}
+		const dialogId = ++this.dialogCounter;
+		await this.emit({ type: "ui_dialog_start", dialog, title, dialogId });
+		try {
+			return await open();
+		} finally {
+			await this.emit({ type: "ui_dialog_end", dialog, title, dialogId });
+		}
 	}
 
 	getUIContext(): ExtensionUIContext {
